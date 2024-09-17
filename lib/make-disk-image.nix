@@ -29,19 +29,16 @@ let
 
   vmTools = pkgs.vmTools.override (
     {
-      rootModules =
-        [
-          "9p"
-          "9pnet_virtio" # we can drop those in future if we stop supporting 24.11
+      rootModules = [
+        "9p"
+        "9pnet_virtio" # we can drop those in future if we stop supporting 24.11
 
-          "virtiofs"
-          "virtio_pci"
-          "virtio_blk"
-          "virtio_balloon"
-          "virtio_rng"
-        ]
-        ++ (lib.optional configSupportsZfs "zfs")
-        ++ cfg.extraRootModules;
+        "virtiofs"
+        "virtio_pci"
+        "virtio_blk"
+        "virtio_balloon"
+        "virtio_rng"
+      ] ++ (lib.optional configSupportsZfs "zfs") ++ cfg.extraRootModules;
       kernel = pkgs.aggregateModules (
         [ cfg.kernelPackages.kernel ]
         ++ lib.optional (
@@ -49,9 +46,7 @@ let
         ) cfg.kernelPackages.${config.boot.zfs.package.kernelModuleAttribute}
       );
     }
-    // lib.optionalAttrs (diskoLib.vmToolsSupportsCustomQemu lib) {
-      customQemu = cfg.qemu;
-    }
+    // lib.optionalAttrs (diskoLib.vmToolsSupportsCustomQemu lib) { customQemu = cfg.qemu; }
   );
   cleanedConfig = diskoLib.testLib.prepareDiskoConfig config diskoLib.testLib.devices;
   systemToInstall = extendModules {
@@ -64,6 +59,7 @@ let
       }
     ];
   };
+
   systemToInstallNative =
     if binfmt.systemsAreDifferent then
       extendModules {
@@ -94,6 +90,23 @@ let
       kmod
     ]
     ++ cfg.extraDependencies;
+
+  prepareFile = name: content: ''
+    out="$(echo "${name}" | base64)"
+    ${if lib.isStorePath content then ''cp --reflink=auto -r "${content}" "$out"'' else content}
+  '';
+
+  prepareFiles = ''
+    (
+      cd $TMPDIR/xchg
+      mkdir -p pre_format_files post_format_files
+      cd pre_format_files
+      ${lib.concatStringsSep "\n" (lib.attrValues (lib.mapAttrs prepareFile cfg.preFormatFiles))}
+      cd ../post_format_files
+      ${lib.concatStringsSep "\n" (lib.attrValues (lib.mapAttrs prepareFile cfg.postFormatFiles))}
+    )
+  '';
+
   preVM = ''
     # shellcheck disable=SC2154
     mkdir -p "$out"
@@ -108,11 +121,20 @@ let
     install -m600 ${pkgs.OVMF.variables} efivars.fd
   '';
 
-  closureInfo = pkgs.closureInfo {
-    rootPaths = [ systemToInstall.config.system.build.toplevel ];
-  };
+  closureInfo = pkgs.closureInfo { rootPaths = [ systemToInstall.config.system.build.toplevel ]; };
+
   partitioner = ''
-    set -efux
+    set -eux
+
+    set +f
+    for src in /tmp/xchg/pre_format_files/*; do
+      [ -e "$src" ] || continue
+      dst=$(basename "$src" | base64 -d)
+      mkdir -p "$(dirname "$dst")"
+      cp -r "$src" "$dst"
+    done
+    set -f
+
     # running udev, stolen from stage-1.sh
     echo "running udev..."
     ln -sfn /proc/self/fd /dev/fd
@@ -131,7 +153,17 @@ let
     ${lib.optionalString diskoCfg.testMode ''
       export IN_DISKO_TEST=1
     ''}
+
     ${lib.getExe systemToInstallNative.config.system.build.destroyFormatMount} --yes-wipe-all-disks
+
+    set +f
+    for src in /tmp/xchg/post_format_files/*; do
+      [ -e "$src" ] || continue
+      dst=/mnt/$(basename "$src" | base64 -d)
+      mkdir -p "$(dirname "$dst")"
+      cp -r "$src" "$dst"
+    done
+    set -f
   '';
 
   installer = lib.optionalString cfg.copyNixStore ''
@@ -163,8 +195,9 @@ in
   system.build.diskoImages = vmTools.runInLinuxVM (
     pkgs.runCommand cfg.name {
       buildInputs = dependencies;
-      inherit preVM QEMU_OPTS;
+      inherit QEMU_OPTS;
       postVM = cfg.extraPostVM;
+      preVM = preVM + prepareFiles;
       inherit (diskoCfg) memSize;
     } (binfmtSetup + partitioner + installer)
   );
@@ -199,20 +232,20 @@ in
     trap 'rm -rf "$TMPDIR"' EXIT
     cd "$TMPDIR"
 
-    mkdir copy_before_disko copy_after_disko
+    mkdir pre_format_files post_format_files
 
     while [[ $# -gt 0 ]]; do
       case "$1" in
       --pre-format-files)
         src=$2
         dst=$3
-        cp --reflink=auto -r "$src" copy_before_disko/"$(echo "$dst" | base64)"
+        cp --reflink=auto -r "$src" pre_format_files/"$(echo "$dst" | base64)"
         shift 2
         ;;
       --post-format-files)
         src=$2
         dst=$3
-        cp --reflink=auto -r "$src" copy_after_disko/"$(echo "$dst" | base64)"
+        cp --reflink=auto -r "$src" post_format_files/"$(echo "$dst" | base64)"
         shift 2
         ;;
       --build-memory)
@@ -235,11 +268,11 @@ in
     export preVM=${
       diskoLib.writeCheckedBash { inherit pkgs checked; } "preVM.sh" ''
         set -efu
-        mv copy_before_disko copy_after_disko xchg/
+        mv pre_format_files post_format_files xchg/
         origBuilder=${pkgs.writeScript "disko-builder" ''
           set -eu
           export PATH=${lib.makeBinPath dependencies}
-          for src in /tmp/xchg/copy_before_disko/*; do
+          for src in /tmp/xchg/pre_format_files/*; do
             [ -e "$src" ] || continue
             dst=$(basename "$src" | base64 -d)
             mkdir -p "$(dirname "$dst")"
@@ -248,7 +281,7 @@ in
           set -f
           ${partitioner}
           set +f
-          for src in /tmp/xchg/copy_after_disko/*; do
+          for src in /tmp/xchg/post_format_files/*; do
             [ -e "$src" ] || continue
             dst=/mnt/$(basename "$src" | base64 -d)
             mkdir -p "$(dirname "$dst")"
@@ -260,7 +293,7 @@ in
         ${preVM}
       ''
     }
-    export postVM=${diskoLib.writeCheckedBash { inherit pkgs checked; } "postVM.sh" cfg.extraPostVM}
+    export postVM=${diskoLib.writeCheckedBash { inherit pkgs checked; } "postVM.sh" cfg.postVM}
 
     build_memory=''${build_memory:-${builtins.toString diskoCfg.memSize}}
     # shellcheck disable=SC2016
